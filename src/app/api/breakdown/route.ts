@@ -1,45 +1,85 @@
 import { getClient } from "@/lib/openai";
 import { OPENAI_MODEL } from "@/lib/config";
 import { NextResponse } from "next/server";
+import { CLASSIFY_TEMPLATE, DECOMPOSE_TEMPLATE, SAFE_DECOMPOSITION } from "@/lib/prompts";
 
-const PROMPT_TEMPLATE = (item: string) => `
-   You are a classifier. 
-   Your job is to look at an ${item} and categorize it into exactly ONE of these:
+async function classify(item: string) {
+   const classification = await getClient().responses.create({
+      model: OPENAI_MODEL,
+      input: CLASSIFY_TEMPLATE(item),
+      text: { format: { type: "json_object" } },
+   });
 
-   simple_material
-   manufactured_item
-   complex_structure
-   biological
-   abstract_system
-   restricted
+   return classification;
+}
 
-   Return ONLY JSON in the following shape:
-      {
-         "category": "...",
-         "reasoning": "..."
-      }
+async function decompose(item: string, category: string) {
+   const decomposition = await getClient().responses.create({
+      model: OPENAI_MODEL,
+      input: DECOMPOSE_TEMPLATE(item, category),
+      text: { format: { type: "json_object" } },
+   });
 
-   Do NOT include materials, systems, decomposition, or notes beyond classification reasoning.
-   `
+   return decomposition;
+}
+
+async function safeEducationalDecomposition(item: string) {
+   const safeDecomposition = await getClient().responses.create({
+      model: OPENAI_MODEL,
+      input: SAFE_DECOMPOSITION(item),
+      text: { format: { type: "json_object" } },
+   })
+   return JSON.parse(safeDecomposition.output_text)
+}
 
 export async function POST(req: Request) {
    try {
-      const body = await req.json()
-      const item = body.item 
+      const { item, consent } = await req.json();
 
       // 1. Classification call
-      const classification = await getClient().responses.create({
-         model: OPENAI_MODEL,
-         input: PROMPT_TEMPLATE(item)
-      })
-      const content = classification.output_text;
-      if (!content) {
-         throw new Error("No content in response")
+      const classification = await classify(item);
+
+      const parsedClassification = JSON.parse(classification.output_text);
+      if (!parsedClassification) {
+         throw new Error("No content in response");
       }
-      const parsed = JSON.parse(content)
-      return NextResponse.json(parsed)
+      // --- restricted early return ---
+      if (parsedClassification.category === "restricted" && !consent) {
+         return NextResponse.json({
+            item,
+            "category": "restricted",
+            "needs_consent": true,
+            "notes": "This item is restricted. Send { consent: true } to retrieve a safe, high-level educational overview."
+         });
+      }
+
+      // -- consent given --
+      if (parsedClassification.category === "restricted" && consent === true) {
+         const educational = await safeEducationalDecomposition(item);
+
+         return NextResponse.json({
+            item,
+            category: "restricted",
+            educational_only: true,
+            ...educational
+         });
+      }
+
+      const category = parsedClassification.category;
+      const decomposition = await decompose(item, category);
+
+      const parsedDecomposition = JSON.parse(decomposition.output_text);
+
+      return NextResponse.json({
+         item,
+         category,
+         ...parsedDecomposition,
+      });
    } catch (error) {
-      console.error("Failed because of : ",  error instanceof Error ? error.message : "processing error")
+      console.error(
+         "Failed because of : ",
+         error instanceof Error ? error.message : "processing error"
+      );
    }
-   return NextResponse.json({ error: "classificaton failed" }, { status: 500 })
+   return NextResponse.json({ error: "classificaton failed" }, { status: 500 });
 }
